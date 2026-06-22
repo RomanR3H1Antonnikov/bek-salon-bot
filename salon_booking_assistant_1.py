@@ -66,11 +66,13 @@ def looks_like_info_request(text: str) -> bool:
 RECORD_TRIGGERS = {
     'хочу', 'записаться', 'запись', 'запиши', 'запишите',
     'стрижк', 'бород', 'моделирован', 'уход', 'маска', 'скраб', 'патч',
+    'тонировк', 'завивк', 'чистк',
     'сегодня', 'завтра', 'послезавтра', 'понедельник', 'вторник', 'среду',
     'четверг', 'пятниц', 'суббот', 'воскресен',
-    'утром', 'днём', 'вечером', 'после', 'до', 'в', 'на', 'время',
+    'утром', 'днём', 'вечером', 'после обеда', 'время',
     'час', 'пол', ' :',
 }
+# Убраны 'в', 'на', 'до' — слишком короткие, дают ложные срабатывания внутри других слов.
 
 
 def looks_like_booking_intent(text: str) -> bool:
@@ -319,7 +321,8 @@ async def handler(event):
         _hour_m = re.search(r'\b(\d{1,2})[:.]\d{2}\b', text)
         if _hour_m:
             _h = int(_hour_m.group(1))
-            if _h >= 22 or _h < 10:
+            # Проверяем только валидные часы (0-23). 25, 67 и т.п. — это не время, а дата.
+            if 0 <= _h <= 23 and (_h >= 22 or _h < 10):
                 await event.reply("Салон работает с 10:00 до 22:00. Выберите другое время!")
                 return
 
@@ -339,6 +342,14 @@ async def handler(event):
                 )
                 return
             free = get_free_slots(MASTER_SLUG, avail_date, duration_min=30, limit=0)
+            # Фильтр по времени суток, если клиент уточнил
+            tl = text.lower()
+            if 'вечер' in tl:
+                free = [s for s in free if s >= "18:00"]
+            elif 'утр' in tl:
+                free = [s for s in free if s < "13:00"]
+            elif 'обед' in tl or 'днём' in tl or 'дн ' in tl:
+                free = [s for s in free if "13:00" <= s < "18:00"]
             if free:
                 shown = free[:12]
                 tail  = " и др." if len(free) > 12 else ""
