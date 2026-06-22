@@ -1,0 +1,16 @@
+# Секреты и локальные данные
+.env
+*.session
+*.db
+bek_chat_id.txt
+*.txt
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
