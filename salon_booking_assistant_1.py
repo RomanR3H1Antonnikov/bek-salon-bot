@@ -125,12 +125,20 @@ async def analyze_message(text: str) -> dict:
 Верни ТОЛЬКО валидный JSON без ```json, без лишнего текста и без комментариев:
 
 {{
-  "intent": "record" | "cancel" | "info" | "other",
+  "intent": "record" | "cancel" | "info" | "availability" | "other",
   "service": "точное название из списка или null",
   "date": "YYYY-MM-DD" или null,
   "time": "HH:MM" (ближайшее 30-минутное) или null,
   "name": имя клиента или null
 }}
+
+intent — правила:
+- "record": клиент хочет записаться (есть дата/время/услуга).
+- "availability": клиент спрашивает, какое время свободно на конкретную дату.
+- "info": клиент спрашивает про услуги или цены.
+- "cancel": клиент хочет отменить запись.
+- "other": всё остальное.
+Если время вне рабочих часов — всё равно ставь "record" и указывай то время, что назвал клиент.
 
 Не пиши ничего кроме JSON!
 """
@@ -266,6 +274,14 @@ async def handler(event):
                             f"на «{rec['service_name']}»\n"
                             "Напоминание придёт за час до визита."
                         )
+                        asyncio.create_task(notify_bek_via_bot(
+                            f"📲 <b>Новая запись (бот)</b>\n"
+                            f"👤 {sender.first_name or '—'}"
+                            + (f" @{sender.username}" if getattr(sender, 'username', None) else "") + "\n"
+                            f"✂️ {rec['service_name']}\n"
+                            f"📅 {human_date(result['date'])}  {result['time_start']}–{result['time_end']}\n"
+                            f"💰 {result['total_price']} ₽"
+                        ))
                     except ValueError as e:
                         await event.reply(f"Не удалось записать: {e}\nПопробуйте другое время.")
                     finally:
@@ -299,11 +315,43 @@ async def handler(event):
             )
             return
 
+        # ─── Пред-проверка времени (до GPT, без лишнего вызова API) ──────────
+        _hour_m = re.search(r'\b(\d{1,2})[:.]\d{2}\b', text)
+        if _hour_m:
+            _h = int(_hour_m.group(1))
+            if _h >= 22 or _h < 10:
+                await event.reply("Салон работает с 10:00 до 22:00. Выберите другое время!")
+                return
+
         # ─── Разбор через GPT ─────────────────────────────────────────────────
         analysis = await analyze_message(text)
 
         if analysis.get("intent") == "info":
             await event.reply(services_menu())
+            return
+
+        if analysis.get("intent") == "availability":
+            avail_date = analysis.get("date")
+            if not avail_date:
+                await event.reply(
+                    "На какой день смотреть свободные окна?\n"
+                    "Напишите, например: завтра, пятница, 25 июня"
+                )
+                return
+            free = get_free_slots(MASTER_SLUG, avail_date, duration_min=30, limit=0)
+            if free:
+                shown = free[:12]
+                tail  = " и др." if len(free) > 12 else ""
+                await event.reply(
+                    f"Свободные окна на {human_date(avail_date)}:\n"
+                    f"{', '.join(shown)}{tail}\n\n"
+                    "Напишите удобное время — и запишу."
+                )
+            else:
+                await event.reply(
+                    f"На {human_date(avail_date)} свободных окон нет.\n"
+                    "Попробуйте другой день."
+                )
             return
 
         if analysis.get("intent") not in ("record", None):
@@ -333,11 +381,20 @@ async def handler(event):
             return
 
         time_str = normalize_time(time_raw)
+        duration = SERVICES_SEED[service_name]["duration"]
+        price    = SERVICES_SEED[service_name]["price"]
 
-        if not ("10:00" <= time_str <= "22:00"):
+        # Проверяем и старт, и конец визита относительно рабочего дня.
+        _end_check = (
+            datetime.strptime(f"2000-01-01 {time_str}", "%Y-%m-%d %H:%M")
+            + timedelta(minutes=duration)
+        )
+        if time_str < "10:00" or _end_check.strftime("%H:%M") > "22:00":
+            _last = (datetime(2000, 1, 1, 22, 0) - timedelta(minutes=duration)).strftime("%H:%M")
             await event.reply(
-                "Салон работает ежедневно с 10:00 до 22:00.\n"
-                "Выберите пожалуйста время в этом диапазоне."
+                f"Салон работает с 10:00 до 22:00.\n"
+                f"Для «{service_name}» ({duration} мин) последний старт — {_last}.\n"
+                f"Выберите другое время."
             )
             return
 
@@ -356,8 +413,6 @@ async def handler(event):
             return
 
         # ─── Проверка доступности ─────────────────────────────────────────────
-        duration = SERVICES_SEED[service_name]["duration"]
-        price    = SERVICES_SEED[service_name]["price"]
 
         if is_slot_available(MASTER_SLUG, date_str, time_str, duration):
             conversations[user_id] = {
