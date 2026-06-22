@@ -1,6 +1,9 @@
 import sqlite3
+from pathlib import Path
 
-DB_FILE = "salon_bookings.db"
+# Абсолютный путь к БД — корень проекта (родитель папки db/).
+# Нужен, чтобы systemd не создавал файл в своём CWD (/root или /tmp).
+DB_FILE = str(Path(__file__).parent.parent / "salon_bookings.db")
 MASTER_SLUG = "bek"
 MASTER_NAME = "Бек"
 

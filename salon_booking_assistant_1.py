@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from openai import AsyncOpenAI
 
@@ -18,12 +19,15 @@ from db import (
     get_pending_master_notifications, mark_master_notified,
 )
 
+_HERE = Path(__file__).parent
+load_dotenv(_HERE / ".env")
+
 # ================== КОНФИГ ==================
 API_ID   = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 PHONE    = os.environ["TG_PHONE"]
 OPENAI_CLIENT = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-SESSION_NAME = "bek_salon_tdlib"
+SESSION_NAME = str(_HERE / "bek_salon_tdlib")  # абсолютный путь — нужен для systemd
 
 # Отдельный бот для уведомлений Беку о записях с сайта.
 # Не принимает клиентов, не связан с юзерботом — только «система → Бек».
@@ -31,7 +35,7 @@ BEK_NOTIFY_BOT_TOKEN = os.environ.get("BEK_NOTIFY_BOT_TOKEN", "")
 BEK_CHAT_ID: int | None = None  # задать вручную или обнаружится из /start Бека
 
 MSK = ZoneInfo("Europe/Moscow")
-_BEK_CHAT_ID_FILE = Path("bek_chat_id.txt")
+_BEK_CHAT_ID_FILE = _HERE / "bek_chat_id.txt"
 
 init_db()
 

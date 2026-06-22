@@ -8,7 +8,11 @@ FastAPI-слой для записи с сайта.
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
