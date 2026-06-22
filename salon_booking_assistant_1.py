@@ -44,6 +44,25 @@ init_db()
 
 SERVICE_NAMES = ", ".join(sorted(SERVICES_SEED.keys()))
 
+INFO_TRIGGERS = {
+    'услуги', 'услуг', 'прайс', 'цены', 'цен', 'стоимость',
+    'что умеешь', 'что делаешь', 'информация', 'инфо', 'info', 'список',
+}
+
+
+def services_menu() -> str:
+    lines = ["Услуги барбершопа «Стрижём и Бреем»:\n"]
+    for name, info in SERVICES_SEED.items():
+        lines.append(f"• {name.capitalize()} — {info['price']} ₽  ({info['duration']} мин)")
+    lines.append("\nНапишите услугу и удобное время, например:\n«стрижка завтра в 17:00»")
+    return "\n".join(lines)
+
+
+def looks_like_info_request(text: str) -> bool:
+    t = text.lower()
+    return any(tr in t for tr in INFO_TRIGGERS)
+
+
 RECORD_TRIGGERS = {
     'хочу', 'записаться', 'запись', 'запиши', 'запишите',
     'стрижк', 'бород', 'моделирован', 'уход', 'маска', 'скраб', 'патч',
@@ -262,6 +281,11 @@ async def handler(event):
                     await event.reply("Пожалуйста, ответьте **да** или **нет**")
                     return
 
+        # ─── Инфо-запрос (услуги, цены) — приоритет перед фильтром брони ────────
+        if looks_like_info_request(text):
+            await event.reply(services_menu())
+            return
+
         # ─── Фильтр намерения ─────────────────────────────────────────────────
         if len(text) < 10 or not looks_like_booking_intent(text):
             await event.reply(
@@ -277,6 +301,10 @@ async def handler(event):
 
         # ─── Разбор через GPT ─────────────────────────────────────────────────
         analysis = await analyze_message(text)
+
+        if analysis.get("intent") == "info":
+            await event.reply(services_menu())
+            return
 
         if analysis.get("intent") not in ("record", None):
             await event.reply(
