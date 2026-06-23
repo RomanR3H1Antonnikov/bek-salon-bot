@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,6 +37,25 @@ BEK_CHAT_ID: int | None = None  # задать вручную или обнар�
 
 MSK = ZoneInfo("Europe/Moscow")
 _BEK_CHAT_ID_FILE = _HERE / "bek_chat_id.txt"
+
+# ================== Защита от петель и флуд-бана ==================
+
+# Служебные Telegram ID — никогда не отвечаем.
+# Добавь ID «Кошелька» когда выяснишь (написать /id боту или найти в логах).
+IGNORED_IDS: frozenset[int] = frozenset({
+    777000,   # Telegram Service (системные уведомления)
+})
+
+_RATE_LIMIT_WINDOW: int = 60   # секунд
+_RATE_LIMIT_MAX:    int = 3    # ответов одному sender за окно
+_rate_history: dict[int, list[float]] = {}
+
+_CB_WINDOW:   int = 60    # секунд скользящего окна
+_CB_MAX:      int = 20    # максимум исходящих за окно
+_CB_COOLDOWN: int = 300   # секунд паузы после срабатывания
+
+_outgoing_times: list[float] = []
+EMERGENCY_STOP: bool = False
 
 init_db()
 
@@ -228,6 +248,52 @@ async def _discover_bek_chat_id_loop() -> None:
             await asyncio.sleep(30)
 
 
+# ================== Защита: rate-limit, circuit-breaker, safe_reply ==================
+
+def _check_rate_limit(sender_id: int) -> bool:
+    """False если sender прислал ≥ _RATE_LIMIT_MAX сообщений за последнюю минуту."""
+    now = time.monotonic()
+    times = [t for t in _rate_history.get(sender_id, []) if now - t < _RATE_LIMIT_WINDOW]
+    if len(times) >= _RATE_LIMIT_MAX:
+        _rate_history[sender_id] = times
+        return False
+    times.append(now)
+    _rate_history[sender_id] = times
+    return True
+
+
+async def _emergency_reset() -> None:
+    await asyncio.sleep(_CB_COOLDOWN)
+    global EMERGENCY_STOP
+    EMERGENCY_STOP = False
+    _outgoing_times.clear()
+    print("[CB] EMERGENCY_STOP сброшен, бот возобновляет работу")
+
+
+async def safe_reply(event, text: str) -> None:
+    """Отправляет ответ клиенту и считает исходящие в circuit-breaker.
+    Если EMERGENCY_STOP или лимит превышен — молча прерывает."""
+    global EMERGENCY_STOP
+    if EMERGENCY_STOP:
+        return
+    now = time.monotonic()
+    while _outgoing_times and now - _outgoing_times[0] > _CB_WINDOW:
+        _outgoing_times.pop(0)
+    _outgoing_times.append(now)
+    if len(_outgoing_times) > _CB_MAX:
+        EMERGENCY_STOP = True
+        asyncio.create_task(_emergency_reset())
+        asyncio.create_task(notify_bek_via_bot(
+            f"⚠️ <b>Circuit breaker</b>: юзербот превысил лимит "
+            f"({_CB_MAX}+ исходящих за {_CB_WINDOW}с). "
+            f"Пауза {_CB_COOLDOWN // 60} мин."
+        ))
+        print(f"[CB] EMERGENCY_STOP=True — {len(_outgoing_times)} исходящих за {_CB_WINDOW}с")
+        return
+    _send = event.reply
+    await _send(text)
+
+
 # ================== Telegram-клиент (юзербот) ==================
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -238,6 +304,10 @@ conversations: dict[int, dict] = {}  # user_id → {service, date, time, expires
 async def handler(event):
     if not event.is_private:
         return
+    if event.out:          # собственные исходящие (incoming=True уже фильтрует, но defence-in-depth)
+        return
+    if EMERGENCY_STOP:     # circuit-breaker сработал — ждём авто-сброса
+        return
 
     user_id = None
     try:
@@ -246,6 +316,15 @@ async def handler(event):
         text    = (event.text or "").strip()
 
         if not text:
+            return
+
+        # ─── Фильтры отправителя (до любой логики и GPT) ─────────────────────
+        if user_id in IGNORED_IDS:
+            return
+        if getattr(sender, 'bot', False):   # корень инцидента с «Кошельком»
+            return
+        if not _check_rate_limit(user_id):
+            print(f"[RATE] {user_id} превысил лимит — игнор")
             return
 
         print(f"[{datetime.now(MSK):%H:%M:%S}] от {user_id}: {text[:80]!r}")
@@ -271,7 +350,7 @@ async def handler(event):
                             client_name=sender.first_name or None,
                             source="bot",
                         )
-                        await event.reply(
+                        await safe_reply(event,
                             f"✅ Записал вас на {result['time_start']} {human_date(result['date'])} "
                             f"на «{rec['service_name']}»\n"
                             "Напоминание придёт за час до визита."
@@ -285,28 +364,28 @@ async def handler(event):
                             f"💰 {result['total_price']} ₽"
                         ))
                     except ValueError as e:
-                        await event.reply(f"Не удалось записать: {e}\nПопробуйте другое время.")
+                        await safe_reply(event,f"Не удалось записать: {e}\nПопробуйте другое время.")
                     finally:
                         del conversations[user_id]
                     return
 
                 elif lower in negative or lower.startswith('нет'):
-                    await event.reply("Запись отменена. Если передумаете — напишите снова.")
+                    await safe_reply(event,"Запись отменена. Если передумаете — напишите снова.")
                     del conversations[user_id]
                     return
 
                 else:
-                    await event.reply("Пожалуйста, ответьте **да** или **нет**")
+                    await safe_reply(event,"Пожалуйста, ответьте **да** или **нет**")
                     return
 
         # ─── Инфо-запрос (услуги, цены) — приоритет перед фильтром брони ────────
         if looks_like_info_request(text):
-            await event.reply(services_menu())
+            await safe_reply(event,services_menu())
             return
 
         # ─── Фильтр намерения ─────────────────────────────────────────────────
         if len(text) < 10 or not looks_like_booking_intent(text):
-            await event.reply(
+            await safe_reply(event,
                 "Привет! Я ассистент барбершопа «Стрижём и Бреем».\n\n"
                 "Напишите, **в какой день и на какое время** хотите записаться.\n"
                 "Примеры:\n"
@@ -323,20 +402,20 @@ async def handler(event):
             _h = int(_hour_m.group(1))
             # Проверяем только валидные часы (0-23). 25, 67 и т.п. — это не время, а дата.
             if 0 <= _h <= 23 and (_h >= 22 or _h < 10):
-                await event.reply("Салон работает с 10:00 до 22:00. Выберите другое время!")
+                await safe_reply(event,"Салон работает с 10:00 до 22:00. Выберите другое время!")
                 return
 
         # ─── Разбор через GPT ─────────────────────────────────────────────────
         analysis = await analyze_message(text)
 
         if analysis.get("intent") == "info":
-            await event.reply(services_menu())
+            await safe_reply(event,services_menu())
             return
 
         if analysis.get("intent") == "availability":
             avail_date = analysis.get("date")
             if not avail_date:
-                await event.reply(
+                await safe_reply(event,
                     "На какой день смотреть свободные окна?\n"
                     "Напишите, например: завтра, пятница, 25 июня"
                 )
@@ -353,20 +432,20 @@ async def handler(event):
             if free:
                 shown = free[:12]
                 tail  = " и др." if len(free) > 12 else ""
-                await event.reply(
+                await safe_reply(event,
                     f"Свободные окна на {human_date(avail_date)}:\n"
                     f"{', '.join(shown)}{tail}\n\n"
                     "Напишите удобное время — и запишу."
                 )
             else:
-                await event.reply(
+                await safe_reply(event,
                     f"На {human_date(avail_date)} свободных окон нет.\n"
                     "Попробуйте другой день."
                 )
             return
 
         if analysis.get("intent") not in ("record", None):
-            await event.reply(
+            await safe_reply(event,
                 "Пока я помогаю только с записью на услуги.\n"
                 "Напишите желаемую дату и время, например:\n"
                 "завтра 15:30\nпятница 18:00\n20.03 в 13:00"
@@ -382,7 +461,7 @@ async def handler(event):
         time_raw = analysis.get("time")
 
         if not date_str or not time_raw:
-            await event.reply(
+            await safe_reply(event,
                 "Не удалось понять дату и время.\n"
                 "Попробуйте написать например:\n"
                 "завтра в 16:30\n"
@@ -402,7 +481,7 @@ async def handler(event):
         )
         if time_str < "10:00" or _end_check.strftime("%H:%M") > "22:00":
             _last = (datetime(2000, 1, 1, 22, 0) - timedelta(minutes=duration)).strftime("%H:%M")
-            await event.reply(
+            await safe_reply(event,
                 f"Салон работает с 10:00 до 22:00.\n"
                 f"Для «{service_name}» ({duration} мин) последний старт — {_last}.\n"
                 f"Выберите другое время."
@@ -414,13 +493,13 @@ async def handler(event):
             now_msk  = datetime.now(MSK)
             today    = now_msk.date()
             if req_date < today:
-                await event.reply("Нельзя записаться в прошлое. Выберите дату от сегодня и позже.")
+                await safe_reply(event,"Нельзя записаться в прошлое. Выберите дату от сегодня и позже.")
                 return
             if req_date == today and time_str <= now_msk.strftime("%H:%M"):
-                await event.reply("На сегодня это время уже прошло. Выберите другое или завтра.")
+                await safe_reply(event,"На сегодня это время уже прошло. Выберите другое или завтра.")
                 return
         except ValueError:
-            await event.reply("Не понял дату. Попробуйте: завтра, пятница, 23.03")
+            await safe_reply(event,"Не понял дату. Попробуйте: завтра, пятница, 23.03")
             return
 
         # ─── Проверка доступности ─────────────────────────────────────────────
@@ -433,7 +512,7 @@ async def handler(event):
                 'time':         time_str,
                 'expires':      datetime.now(MSK).replace(tzinfo=None) + timedelta(minutes=7),
             }
-            await event.reply(
+            await safe_reply(event,
                 f"Свободно:\n"
                 f"📅 {human_date(date_str)}  {time_str}\n"
                 f"✂️ {service_name}\n"
@@ -444,14 +523,14 @@ async def handler(event):
             alts = get_free_slots(MASTER_SLUG, date_str, duration, limit=6)
             if alts:
                 alt_text = ', '.join(alts[:4]) + (' и др.' if len(alts) > 4 else '')
-                await event.reply(
+                await safe_reply(event,
                     f"Это время занято.\n"
                     f"Свободные окна на {human_date(date_str)}:\n"
                     f"{alt_text}\n\n"
                     "Напишите желаемое время."
                 )
             else:
-                await event.reply(
+                await safe_reply(event,
                     f"На {human_date(date_str)} свободных окон нет.\n"
                     "Попробуйте другой день."
                 )
@@ -460,7 +539,7 @@ async def handler(event):
         print(f"[ERROR] handler: {e}")
         if user_id is not None and user_id in conversations:
             del conversations[user_id]
-            await event.reply("Произошла ошибка. Давайте начнём заново — напишите день и время.")
+            await safe_reply(event,"Произошла ошибка. Давайте начнём заново — напишите день и время.")
 
 
 # ================== Фоновые задачи ==================
