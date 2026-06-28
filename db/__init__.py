@@ -1,4 +1,9 @@
-from .schema import init_db, seed_db, get_conn, SERVICES_SEED, SERVICES_BY_SLUG, MASTER_SLUG, DB_FILE, sum_duration
+from .schema import (
+    init_db, seed_db, get_conn,
+    SERVICES_SEED, SERVICES_BY_SLUG,
+    MASTER_SLUG, MASTERS_SEED,
+    DB_FILE, sum_duration,
+)
 from .bookings import (
     SlotTaken,
     create_booking,
@@ -8,4 +13,5 @@ from .bookings import (
     mark_reminded,
     get_pending_master_notifications,
     mark_master_notified,
+    list_masters,
 )

@@ -4,8 +4,12 @@ from pathlib import Path
 # Абсолютный путь к БД — корень проекта (родитель папки db/).
 # Нужен, чтобы systemd не создавал файл в своём CWD (/root или /tmp).
 DB_FILE = str(Path(__file__).parent.parent / "salon_bookings.db")
-MASTER_SLUG = "bek"
-MASTER_NAME = "Бек"
+MASTER_SLUG = "bek"   # владелец — дефолт для бота и backward-compat
+
+MASTERS_SEED: dict[str, dict] = {
+    "bek": {"name": "Бек", "role": "owner"},
+    "ali": {"name": "Али", "role": "master"},
+}
 
 # Ключ — русское название (для GPT-промпта бота и дисплея).
 # slug — идентификатор для API и фронта. Финальный каталог: 12 позиций (сверен с сайтом).
@@ -74,10 +78,15 @@ def init_db() -> None:
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             slug        TEXT    NOT NULL UNIQUE,
             name        TEXT    NOT NULL,
+            role        TEXT    NOT NULL DEFAULT 'master',  -- 'owner' | 'master'
             telegram_id INTEGER,
             created_at  TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
         )
     """)
+    # Миграция: добавляем role к существующим БД без этой колонки
+    c.execute("PRAGMA table_info(masters)")
+    if "role" not in {row[1] for row in c.fetchall()}:
+        c.execute("ALTER TABLE masters ADD COLUMN role TEXT NOT NULL DEFAULT 'master'")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS services (
@@ -177,22 +186,30 @@ def init_db() -> None:
 
 
 def seed_db(master_telegram_id: int | None = None) -> int:
-    """Идемпотентный сид: мастер, услуги, рабочие часы. Возвращает master_id."""
+    """Идемпотентный сид: мастера, услуги, рабочие часы.
+    master_telegram_id — Telegram ID владельца (bek), задаётся при старте юзербота.
+    Возвращает id мастера-владельца (bek)."""
     conn = get_conn()
     c = conn.cursor()
 
-    # Мастер
-    c.execute(
-        "INSERT OR IGNORE INTO masters (slug, name, telegram_id) VALUES (?, ?, ?)",
-        (MASTER_SLUG, MASTER_NAME, master_telegram_id),
-    )
+    # Мастера — все из MASTERS_SEED
+    for slug, info in MASTERS_SEED.items():
+        c.execute(
+            "INSERT OR IGNORE INTO masters (slug, name, role) VALUES (?, ?, ?)",
+            (slug, info["name"], info["role"]),
+        )
+        c.execute(
+            "UPDATE masters SET name = ?, role = ? WHERE slug = ?",
+            (info["name"], info["role"], slug),
+        )
+    # Telegram ID владельца (bek) — проставляем только для него
     if master_telegram_id:
         c.execute(
             "UPDATE masters SET telegram_id = ? WHERE slug = ?",
             (master_telegram_id, MASTER_SLUG),
         )
     c.execute("SELECT id FROM masters WHERE slug = ?", (MASTER_SLUG,))
-    master_id: int = c.fetchone()[0]
+    owner_id: int = c.fetchone()[0]
 
     # Услуги: три шага, чтобы корректно обрабатывать переименование slug'ов.
     # Проблема: UNIQUE(slug) и UNIQUE(name) — если slug меняется при том же name,
@@ -230,17 +247,26 @@ def seed_db(master_telegram_id: int | None = None) -> int:
         active_slugs,
     )
 
-    # Рабочие часы: ежедневно 10:00–22:00
-    for weekday in range(7):
-        c.execute(
-            """
-            INSERT OR IGNORE INTO working_hours (master_id, weekday, open_time, close_time)
-            VALUES (?, ?, '10:00', '22:00')
-            """,
-            (master_id, weekday),
-        )
+    # Рабочие часы: ежедневно 10:00–22:00 для ВСЕХ мастеров из MASTERS_SEED
+    c.execute("SELECT id FROM masters WHERE slug IN ({})".format(
+        ",".join("?" * len(MASTERS_SEED))
+    ), list(MASTERS_SEED.keys()))
+    all_master_ids = [row[0] for row in c.fetchall()]
+    for mid in all_master_ids:
+        for weekday in range(7):
+            c.execute(
+                """
+                INSERT OR IGNORE INTO working_hours (master_id, weekday, open_time, close_time)
+                VALUES (?, ?, '10:00', '22:00')
+                """,
+                (mid, weekday),
+            )
 
     conn.commit()
     conn.close()
-    print(f"[SEED] Мастер id={master_id}, услуги ({len(SERVICES_SEED)} шт.), часы 10:00–22:00 ежедневно")
-    return master_id
+    print(
+        f"[SEED] Мастеров: {len(MASTERS_SEED)} "
+        f"({', '.join(MASTERS_SEED.keys())}), "
+        f"услуги ({len(SERVICES_SEED)} шт.), часы 10:00–22:00 ежедневно"
+    )
+    return owner_id

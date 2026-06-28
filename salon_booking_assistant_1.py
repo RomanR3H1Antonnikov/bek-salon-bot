@@ -18,6 +18,7 @@ from db import (
     create_booking, is_slot_available, get_free_slots,
     get_upcoming_reminders, mark_reminded,
     get_pending_master_notifications, mark_master_notified,
+    list_masters,
 )
 
 _HERE = Path(__file__).parent
@@ -630,13 +631,18 @@ async def master_notification_loop():
                 name  = n["client_name"] or "—"
                 phone = n["phone"] or "нет"
 
+                master_line = (
+                    f"\n👨‍💼 {n['master_name']}"
+                    if n.get("master_name") else ""
+                )
                 text = (
                     f"📲 <b>Запись с сайта</b>\n\n"
                     f"👤 {name}\n"
                     f"📞 {phone}\n"
                     f"📅 {dt.strftime('%d.%m.%Y')}  "
                     f"<b>{dt.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</b>\n"
-                    f"✂️ {n['service']}\n"
+                    f"✂️ {n['service']}"
+                    f"{master_line}\n"
                     f"⏱ {dur} мин  💰 {n['price']} ₽"
                 )
 

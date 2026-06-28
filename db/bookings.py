@@ -2,7 +2,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .schema import get_conn, get_conn_immediate, SERVICES_SEED, SERVICES_BY_SLUG, MASTER_SLUG, sum_duration
+from .schema import get_conn, get_conn_immediate, SERVICES_SEED, SERVICES_BY_SLUG, MASTER_SLUG, MASTERS_SEED, sum_duration
 
 
 class SlotTaken(ValueError):
@@ -324,11 +324,13 @@ def get_pending_master_notifications() -> list[dict]:
             """
             SELECT b.id, b.start_time, b.end_time,
                    c.name, c.phone, c.telegram_id,
-                   s.name as service, bs.price
+                   s.name as service, bs.price,
+                   m.name as master_name, m.slug as master_slug
             FROM bookings b
             JOIN clients          c  ON c.id  = b.client_id
             JOIN booking_services bs ON bs.booking_id = b.id
             JOIN services         s  ON s.id  = bs.service_id
+            JOIN masters          m  ON m.id  = b.master_id
             WHERE b.source = 'site'
               AND b.status = 'booked'
               AND b.master_notified = 0
@@ -337,17 +339,30 @@ def get_pending_master_notifications() -> list[dict]:
         )
         return [
             {
-                "booking_id":  r[0],
-                "start_time":  r[1],
-                "end_time":    r[2],
-                "client_name": r[3],
-                "phone":       r[4],
-                "telegram_id": r[5],
-                "service":     r[6],
-                "price":       r[7],
+                "booking_id":   r[0],
+                "start_time":   r[1],
+                "end_time":     r[2],
+                "client_name":  r[3],
+                "phone":        r[4],
+                "telegram_id":  r[5],
+                "service":      r[6],
+                "price":        r[7],
+                "master_name":  r[8],
+                "master_slug":  r[9],
             }
             for r in c.fetchall()
         ]
+    finally:
+        conn.close()
+
+
+def list_masters() -> list[dict]:
+    """Список мастеров из БД (slug, name, role)."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT slug, name, role FROM masters ORDER BY role DESC, name")
+        return [{"slug": r[0], "name": r[1], "role": r[2]} for r in c.fetchall()]
     finally:
         conn.close()
 

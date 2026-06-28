@@ -18,7 +18,11 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from db import MASTER_SLUG, SlotTaken, create_booking, get_free_slots, init_db, sum_duration
+from db import (
+    MASTER_SLUG, MASTERS_SEED,
+    SlotTaken, create_booking, get_free_slots, list_masters,
+    init_db, sum_duration,
+)
 
 # ================== КОНФИГ ==================
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
@@ -56,6 +60,20 @@ def normalize_phone(raw: str) -> str:
 app = FastAPI(title="Salon Booking API", docs_url=None, redoc_url=None)
 
 
+def _check_master(master_id: str) -> None:
+    if master_id not in MASTERS_SEED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный мастер: {master_id!r}. Доступны: {list(MASTERS_SEED.keys())}",
+        )
+
+
+@app.get("/masters")
+async def get_masters(_: None = Depends(verify_token)):
+    """Список мастеров салона."""
+    return {"masters": list_masters()}
+
+
 @app.get("/slots")
 async def get_slots(
     date:      str,
@@ -68,6 +86,8 @@ async def get_slots(
     services=mens-haircut&services=beard-modeling → длительность суммируется.
     Без services → дефолтные 30 мин.
     """
+    _check_master(master_id)
+
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
@@ -109,6 +129,8 @@ async def book(
       409 — slot_taken (время занято)
       500 — внутренняя ошибка
     """
+    _check_master(req.master_id)
+
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name не может быть пустым")
 
