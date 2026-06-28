@@ -224,39 +224,6 @@ async def notify_bek_via_bot(html_text: str) -> bool:
         return False
 
 
-async def _discover_bek_chat_id_loop() -> None:
-    """Поллит бот уведомлений, ждёт /start от Бека, сохраняет chat_id в файл."""
-    global _bek_chat_id
-    if not BEK_NOTIFY_BOT_TOKEN:
-        print("[NOTIFY] BEK_NOTIFY_BOT_TOKEN не задан — уведомления Беку отключены")
-        return
-
-    print("[NOTIFY] Жду /start от Бека в боте уведомлений...")
-    url    = f"https://api.telegram.org/bot{BEK_NOTIFY_BOT_TOKEN}/getUpdates"
-    offset = 0
-
-    async with aiohttp.ClientSession() as session:
-        while _bek_chat_id is None:
-            try:
-                async with session.get(
-                    url,
-                    params={"offset": offset, "timeout": 0, "limit": 20},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    data = await resp.json()
-                    for upd in data.get("result", []):
-                        offset = upd["update_id"] + 1
-                        msg = upd.get("message", {})
-                        if msg.get("text", "").startswith("/start"):
-                            _bek_chat_id = msg["chat"]["id"]
-                            _BEK_CHAT_ID_FILE.write_text(str(_bek_chat_id))
-                            print(f"[NOTIFY] BEK_CHAT_ID = {_bek_chat_id} (сохранён в {_BEK_CHAT_ID_FILE})")
-                            return
-            except Exception as e:
-                print(f"[NOTIFY] getUpdates error: {e}")
-            await asyncio.sleep(30)
-
-
 # ================== Защита: rate-limit, circuit-breaker, safe_reply ==================
 
 def _check_rate_limit(sender_id: int) -> bool:
@@ -679,13 +646,13 @@ async def main():
 
     seed_db(master_telegram_id=me.id)
 
-    # Разрешение BEK_CHAT_ID: конфиг → файл → авто-обнаружение
+    # BEK_CHAT_ID — из файла (записывается manage_bot.py при /start от Бека)
     if _bek_chat_id is None:
         _bek_chat_id = _load_cached_chat_id()
     if _bek_chat_id:
         print(f"[NOTIFY] BEK_CHAT_ID = {_bek_chat_id}")
     else:
-        asyncio.create_task(_discover_bek_chat_id_loop())
+        print("[NOTIFY] bek_chat_id.txt не найден — запусти manage_bot.py и отправь /start")
 
     asyncio.create_task(reminder_loop())
     asyncio.create_task(master_notification_loop())
