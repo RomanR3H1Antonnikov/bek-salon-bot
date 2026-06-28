@@ -57,6 +57,14 @@ _CB_COOLDOWN: int = 300   # секунд паузы после срабатыв�
 _outgoing_times: list[float] = []
 EMERGENCY_STOP: bool = False
 
+# ─── Рубильник автоответов ─────────────────────────────────────────────
+# BEK_OWNER_ID — Telegram user_id владельца (тот, кто пишет /answersoff).
+# Если не задан, команда недоступна (лучше задать в .env сразу).
+BEK_OWNER_ID: int | None = (
+    int(os.environ["BEK_OWNER_ID"]) if os.environ.get("BEK_OWNER_ID") else None
+)
+_AUTO_ANSWER_FILE = _HERE / "auto_answer.txt"
+
 init_db()
 
 
@@ -294,6 +302,19 @@ async def safe_reply(event, text: str) -> None:
     await _send(text)
 
 
+def _load_auto_answer() -> bool:
+    if _AUTO_ANSWER_FILE.exists():
+        return _AUTO_ANSWER_FILE.read_text().strip() != "0"
+    return True
+
+
+def _save_auto_answer(state: bool) -> None:
+    _AUTO_ANSWER_FILE.write_text("1" if state else "0")
+
+
+AUTO_ANSWER_ENABLED: bool = _load_auto_answer()
+
+
 # ================== Telegram-клиент (юзербот) ==================
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -323,11 +344,41 @@ async def handler(event):
             return
         if getattr(sender, 'bot', False):   # корень инцидента с «Кошельком»
             return
+
+        # ─── Команды владельца (до rate-limit, чтобы не расходовать квоту) ──────
+        if BEK_OWNER_ID and user_id == BEK_OWNER_ID:
+            global AUTO_ANSWER_ENABLED
+            if text.lower() == "/answersoff":
+                AUTO_ANSWER_ENABLED = False
+                _save_auto_answer(False)
+                await safe_reply(event, "Автоответы выключены. Приём записей и система работают.")
+                print("[SWITCH] AUTO_ANSWER_ENABLED = False")
+                return
+            if text.lower() == "/answerson":
+                AUTO_ANSWER_ENABLED = True
+                _save_auto_answer(True)
+                await safe_reply(event, "Автоответы включены.")
+                print("[SWITCH] AUTO_ANSWER_ENABLED = True")
+                return
+
         if not _check_rate_limit(user_id):
             print(f"[RATE] {user_id} превысил лимит — игнор")
             return
 
         print(f"[{datetime.now(MSK):%H:%M:%S}] от {user_id}: {text[:80]!r}")
+
+        # ─── Рубильник автоответов ────────────────────────────────────────────
+        # Логируем и обнаруживаем намерение записи — но клиенту не отвечаем.
+        if not AUTO_ANSWER_ENABLED:
+            if looks_like_booking_intent(text):
+                name = getattr(sender, 'first_name', None) or f"id{user_id}"
+                link = (f" (@{sender.username})" if getattr(sender, 'username', None) else "")
+                asyncio.create_task(notify_bek_via_bot(
+                    f"🔕 <b>Автоответы выключены</b>\n"
+                    f"Клиент {name}{link} написал про запись — посмотри личку."
+                ))
+            return
+
         await asyncio.sleep(random.uniform(1.3, 3.8))
 
         # ─── Ожидаем подтверждение ────────────────────────────────────────────
