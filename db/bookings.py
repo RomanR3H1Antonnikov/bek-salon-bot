@@ -1,3 +1,4 @@
+import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -87,16 +88,22 @@ def _check_permission(
     booking_master_id: int,
     client_tg: int | None,
     client_phone: str | None,
+    booking_manage_token: str | None,
     by_telegram_id: int | None,
     by_phone: str | None,
     by_master_slug: str | None,
+    by_manage_token: str | None,
     is_owner: bool,
     action: str,
 ) -> None:
     """Raises ValueError если запрашивающий не имеет права на действие с бронью."""
     if is_owner:
         return
-    if by_master_slug:
+    if by_manage_token is not None:
+        if booking_manage_token and booking_manage_token == by_manage_token:
+            return
+        raise ValueError("Неверный токен управления записью")
+    if by_master_slug is not None:
         c.execute("SELECT id FROM masters WHERE slug = ?", (by_master_slug,))
         row = c.fetchone()
         if not row or row[0] != booking_master_id:
@@ -166,14 +173,17 @@ def _insert_booking(
         conn, telegram_id=telegram_id, name=client_name, phone=phone
     )
 
+    manage_token = secrets.token_urlsafe(16)
+
     c.execute(
         """
         INSERT INTO bookings
-            (master_id, client_id, start_time, end_time, status, source, note, master_notified)
-        VALUES (?, ?, ?, ?, 'booked', ?, ?, ?)
+            (master_id, client_id, start_time, end_time, status, source, note,
+             master_notified, manage_token)
+        VALUES (?, ?, ?, ?, 'booked', ?, ?, ?, ?)
         """,
         (master_id, client_id, start_iso, end_iso, source, note,
-         1 if source == "bot" else 0),
+         1 if source == "bot" else 0, manage_token),
     )
     booking_id = c.lastrowid
 
@@ -193,14 +203,15 @@ def _insert_booking(
         total_price += price
 
     return {
-        "booking_id":   booking_id,
-        "date":         date,
-        "time_start":   time_start,
-        "time_end":     end_dt.strftime("%H:%M"),
-        "services":     services,
-        "total_price":  total_price,
-        "duration_min": total_duration,
-        "source":       source,
+        "booking_id":    booking_id,
+        "date":          date,
+        "time_start":    time_start,
+        "time_end":      end_dt.strftime("%H:%M"),
+        "services":      services,
+        "total_price":   total_price,
+        "duration_min":  total_duration,
+        "source":        source,
+        "manage_token":  manage_token,
     }
 
 
@@ -220,7 +231,7 @@ def create_booking(
 ) -> dict:
     """
     Единая функция брони для юзербота и FastAPI.
-    Все проверки (выходной, рабочие часы, пересечения) внутри BEGIN IMMEDIATE.
+    Возвращает manage_token — клиент получает его для управления записью.
     Raises SlotTaken при конфликте, ValueError при остальных ошибках валидации.
     """
     sum_duration(services)  # ранняя валидация до захвата блокировки БД
@@ -247,16 +258,17 @@ def cancel_booking(
     *,
     by_telegram_id: int | None = None,   # клиент-бот: идентифицирован по TG ID
     by_phone: str | None = None,          # клиент-сайт: идентифицирован по телефону
+    by_manage_token: str | None = None,   # клиент: предъявил токен управления
     by_master_slug: str | None = None,    # персонал-мастер: только свои записи
     is_owner: bool = False,               # владелец (Бек): отменяет любую
 ) -> dict:
     """
-    Помечает запись как 'cancelled'. Никакого DELETE — история сохраняется.
+    Помечает запись как 'cancelled'. История сохраняется (никакого DELETE).
     Слот освобождается автоматически (все запросы занятости фильтруют status='booked').
 
     Raises ValueError:
       - запись не найдена / уже отменена / статус не 'booked'
-      - now(МСК) >= start_time - 15 мин (правило 15 минут)
+      - now(МСК) >= start_time - 15 мин
       - у запрашивающего нет прав
     """
     now_msk = datetime.now(MSK).replace(tzinfo=None)
@@ -268,7 +280,7 @@ def cancel_booking(
         c.execute(
             """
             SELECT b.start_time, b.status, b.master_id,
-                   cl.telegram_id, cl.phone
+                   cl.telegram_id, cl.phone, b.manage_token
             FROM bookings b
             JOIN clients cl ON cl.id = b.client_id
             WHERE b.id = ?
@@ -278,7 +290,7 @@ def cancel_booking(
         row = c.fetchone()
         if not row:
             raise ValueError(f"Запись #{booking_id} не найдена")
-        start_iso, status, master_id, client_tg, client_phone = row
+        start_iso, status, master_id, client_tg, client_phone, booking_token = row
 
         if status == "cancelled":
             raise ValueError(f"Запись #{booking_id} уже отменена")
@@ -297,8 +309,10 @@ def cancel_booking(
             booking_master_id=master_id,
             client_tg=client_tg,
             client_phone=client_phone,
+            booking_manage_token=booking_token,
             by_telegram_id=by_telegram_id,
             by_phone=by_phone,
+            by_manage_token=by_manage_token,
             by_master_slug=by_master_slug,
             is_owner=is_owner,
             action="отменить",
@@ -324,6 +338,7 @@ def reschedule_booking(
     new_services: list[str] | None = None,  # None → берём из старой брони
     by_telegram_id: int | None = None,
     by_phone: str | None = None,
+    by_manage_token: str | None = None,
     by_master_slug: str | None = None,
     is_owner: bool = False,
 ) -> dict:
@@ -334,7 +349,8 @@ def reschedule_booking(
       Если новый слот занят (SlotTaken) или новое время невалидно (ValueError),
       ROLLBACK возвращает старую запись в статус 'booked' — она остаётся нетронутой.
 
-    source нового слота наследуется от старого (bot/site).
+    Новая запись получает свой manage_token (старый токен становится недействительным).
+    source наследуется от старой брони.
     Уведомление о переносе — ответственность вызывающего канала.
 
     Raises SlotTaken, ValueError.
@@ -351,7 +367,7 @@ def reschedule_booking(
             """
             SELECT b.start_time, b.status, b.master_id,
                    cl.telegram_id, cl.phone, cl.name,
-                   b.source
+                   b.source, b.manage_token
             FROM bookings b
             JOIN clients cl ON cl.id = b.client_id
             WHERE b.id = ?
@@ -361,7 +377,8 @@ def reschedule_booking(
         row = c.fetchone()
         if not row:
             raise ValueError(f"Запись #{booking_id} не найдена")
-        start_iso, status, old_master_id, client_tg, client_phone, client_name, old_source = row
+        (start_iso, status, old_master_id, client_tg, client_phone,
+         client_name, old_source, booking_token) = row
 
         if status == "cancelled":
             raise ValueError(f"Запись #{booking_id} уже отменена, перенос невозможен")
@@ -382,8 +399,10 @@ def reschedule_booking(
             booking_master_id=old_master_id,
             client_tg=client_tg,
             client_phone=client_phone,
+            booking_manage_token=booking_token,
             by_telegram_id=by_telegram_id,
             by_phone=by_phone,
+            by_manage_token=by_manage_token,
             by_master_slug=by_master_slug,
             is_owner=is_owner,
             action="перенести",
@@ -406,7 +425,7 @@ def reschedule_booking(
         # ── 5. Отменяем старую бронь ──────────────────────────────────────────
         c.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
 
-        # ── 6. Создаём новую (может поднять SlotTaken → весь блок откатится) ─
+        # ── 6. Создаём новую (SlotTaken → весь блок откатится) ───────────────
         new_booking = _insert_booking(
             conn, c,
             master_slug=new_master_slug,
@@ -426,6 +445,75 @@ def reschedule_booking(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def get_booking_by_token(token: str) -> dict | None:
+    """Возвращает полную информацию о брони по manage_token, или None если не найдена."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT b.id, b.start_time, b.end_time, b.status,
+                   m.slug, m.name,
+                   cl.name
+            FROM bookings b
+            JOIN masters m  ON m.id  = b.master_id
+            JOIN clients cl ON cl.id = b.client_id
+            WHERE b.manage_token = ?
+            """,
+            (token,),
+        )
+        row = c.fetchone()
+        if not row:
+            return None
+        booking_id, start_iso, end_iso, status, master_slug, master_name, client_name = row
+
+        c.execute(
+            """
+            SELECT s.slug, s.name, bs.price
+            FROM booking_services bs
+            JOIN services s ON s.id = bs.service_id
+            WHERE bs.booking_id = ?
+            """,
+            (booking_id,),
+        )
+        svcs = c.fetchall()
+
+        now_msk = datetime.now(MSK).replace(tzinfo=None)
+        start_dt = datetime.strptime(start_iso, "%Y-%m-%d %H:%M")
+        end_dt   = datetime.strptime(end_iso,   "%Y-%m-%d %H:%M")
+
+        # Граничные случаи:
+        # - past:      end_dt <= now  (не >=, чтобы не перекрываться с active)
+        # - active:    status='booked' AND end_dt > now
+        # - cancelled: status='cancelled' (независимо от времени)
+        # can_cancel:  строго < (start - 15мин), не <=, чтобы совпадало с cancel_booking
+        if status == "cancelled":
+            computed_status = "cancelled"
+            can_cancel = False
+        elif end_dt <= now_msk:
+            computed_status = "past"
+            can_cancel = False
+        else:
+            computed_status = "active"
+            can_cancel = now_msk < start_dt - timedelta(minutes=15)
+
+        return {
+            "booking_id":   booking_id,
+            "master_slug":  master_slug,
+            "master_name":  master_name,
+            "client_name":  client_name,
+            "services":     [{"slug": r[0], "name": r[1], "price": r[2]} for r in svcs],
+            "date":         start_dt.strftime("%Y-%m-%d"),
+            "time_start":   start_dt.strftime("%H:%M"),
+            "time_end":     end_dt.strftime("%H:%M"),
+            "total_price":  sum(r[2] for r in svcs),
+            "status":       computed_status,
+            "can_cancel":   can_cancel,
+        }
     finally:
         conn.close()
 
@@ -515,7 +603,7 @@ def get_free_slots(
 
 def get_upcoming_reminders() -> list[dict]:
     """Записи, до которых < 1 ч и напоминание клиенту ещё не отправлено."""
-    now  = datetime.now(MSK).replace(tzinfo=None)  # наивное МСК для сравнения с start_time
+    now  = datetime.now(MSK).replace(tzinfo=None)
     soon = now + timedelta(hours=1)
 
     conn = get_conn()

@@ -7,9 +7,10 @@ FastAPI-слой для записи с сайта.
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
@@ -20,7 +21,9 @@ from pydantic import BaseModel
 
 from db import (
     MASTER_SLUG, MASTERS_SEED,
-    SlotTaken, create_booking, get_free_slots, list_masters,
+    SlotTaken,
+    create_booking, cancel_booking, reschedule_booking, get_booking_by_token,
+    get_free_slots, list_masters,
     init_db, sum_duration,
 )
 
@@ -28,6 +31,7 @@ from db import (
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
 PORT           = 8000
 HOST           = "127.0.0.1"
+MSK            = ZoneInfo("Europe/Moscow")
 
 init_db()
 
@@ -172,6 +176,93 @@ async def book(
 
     except Exception as e:
         print(f"[API] Ошибка /book: {e}")
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
+
+
+# ── Управление записью по токену ──────────────────────────────────────────────
+
+
+@app.get("/booking/{token}")
+async def get_booking(token: str, _: None = Depends(verify_token)):
+    """
+    Информация о брони по manage_token.
+    status: "active" | "cancelled" | "past"
+    can_cancel: сервер считает правило 15 мин — фронт не дублирует логику.
+    404 если токен не найден (никогда не возвращаем «не найден, потому что отменена»).
+    """
+    info = get_booking_by_token(token)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    return info
+
+
+class CancelRequest(BaseModel):
+    token: str
+
+
+@app.post("/cancel")
+async def cancel(req: CancelRequest, _: None = Depends(verify_token)):
+    """
+    Отмена брони по manage_token.
+    409 — уже отменена / правило 15 мин.
+    """
+    info = get_booking_by_token(req.token)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+
+    try:
+        result = cancel_booking(info["booking_id"], by_manage_token=req.token)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+class RescheduleRequest(BaseModel):
+    token:     str
+    master_id: str       = MASTER_SLUG
+    date:      str        # YYYY-MM-DD
+    time:      str        # HH:MM
+    services:  list[str] | None = None  # None → наследуем из старой брони
+
+
+@app.post("/reschedule")
+async def reschedule(req: RescheduleRequest, _: None = Depends(verify_token)):
+    """
+    Атомарный перенос брони по manage_token.
+    Новая запись получает новый manage_token (старый перестаёт работать).
+    409 — занятый слот (откат) / правило 15 мин / уже отменена.
+    """
+    _check_master(req.master_id)
+
+    try:
+        datetime.strptime(req.date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Неверный формат date (YYYY-MM-DD)")
+    try:
+        datetime.strptime(req.time, "%H:%M")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Неверный формат time (HH:MM)")
+
+    info = get_booking_by_token(req.token)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+
+    try:
+        result = reschedule_booking(
+            info["booking_id"],
+            new_master_slug=req.master_id,
+            new_date=req.date,
+            new_time=req.time,
+            new_services=req.services,
+            by_manage_token=req.token,
+        )
+        return result
+    except SlotTaken as e:
+        raise HTTPException(status_code=409, detail={"code": "slot_taken", "message": str(e)})
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        print(f"[API] Ошибка /reschedule: {e}")
         raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")
 
 

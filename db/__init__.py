@@ -9,6 +9,7 @@ from .bookings import (
     create_booking,
     cancel_booking,
     reschedule_booking,
+    get_booking_by_token,
     is_slot_available,
     get_free_slots,
     get_upcoming_reminders,

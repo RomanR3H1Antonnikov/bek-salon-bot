@@ -369,10 +369,14 @@ async def handler(event):
                             client_name=sender.first_name or None,
                             source="bot",
                         )
+                        manage_url = (
+                            f"https://barber.rehy.store/b/{result['manage_token']}"
+                        )
                         await safe_reply(event,
                             f"✅ Записал вас на {result['time_start']} {human_date(result['date'])} "
                             f"на «{rec['service_name']}»\n"
-                            "Напоминание придёт за час до визита."
+                            "Напоминание придёт за час до визита.\n\n"
+                            f"🔗 Управление записью:\n{manage_url}"
                         )
                         asyncio.create_task(notify_bek_via_bot(
                             f"📲 <b>Новая запись (бот)</b>\n"
