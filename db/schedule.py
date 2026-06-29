@@ -3,7 +3,7 @@
 Все write-функции — только для role=owner; enforce на уровне бота, не здесь.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .schema import get_conn
@@ -211,6 +211,56 @@ def get_working_hours(master_slug: str) -> list[dict]:
         conn.close()
 
 
+def get_weekday_conflicts(
+    master_slug: str,
+    weekday: int,
+    horizon_days: int = 90,
+) -> list[dict]:
+    """
+    Booked-записи мастера на все будущие даты заданного дня недели
+    в горизонте horizon_days дней от сегодня (МСК).
+
+    weekday: 0=Пн … 6=Вс (Python-конвенция).
+
+    Конвертация в SQLite %w: Sun=0, Mon=1 … Sat=6
+    → sqlite_wd = (py_wd + 1) % 7
+    """
+    today       = datetime.now(MSK).strftime("%Y-%m-%d")
+    horizon_end = (datetime.now(MSK) + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
+    sqlite_wd   = str((weekday + 1) % 7)
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        mid = _master_id(c, master_slug)
+        c.execute(
+            """
+            SELECT b.id, b.start_time, b.end_time, cl.name, cl.phone
+            FROM   bookings b
+            JOIN   clients cl ON cl.id = b.client_id
+            WHERE  b.master_id  = ?
+              AND  b.status     = 'booked'
+              AND  b.start_time >= ?
+              AND  b.start_time <  ?
+              AND  strftime('%w', b.start_time) = ?
+            ORDER  BY b.start_time
+            """,
+            (mid, today + " 00:00", horizon_end + " 00:00", sqlite_wd),
+        )
+        return [
+            {
+                "booking_id":   r[0],
+                "date":         r[1][:10],
+                "time":         r[1][11:16] + "–" + r[2][11:16],
+                "client_name":  r[3] or "—",
+                "client_phone": r[4] or "—",
+            }
+            for r in c.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
 def set_weekday_hours(
     master_slug: str, weekday: int, open_time: str, close_time: str
 ) -> None:
@@ -218,10 +268,13 @@ def set_weekday_hours(
     Обновляет регулярные часы мастера на конкретный день недели.
     weekday: 0=Пн … 6=Вс.
 
-    Не проверяет конфликты с существующими записями:
-    working_hours — долгосрочный базис, уже подтверждённые брони он не отменяет.
-    Если нужно закрыть конкретный день — используй set_day_off + дату.
+    Raises ScheduleConflict если в горизонте 90 дней есть booked-записи
+    на этот день недели — изменение затронуло бы их все разом.
     """
+    conflicts = get_weekday_conflicts(master_slug, weekday)
+    if conflicts:
+        raise ScheduleConflict(conflicts)
+
     conn = get_conn()
     try:
         c = conn.cursor()

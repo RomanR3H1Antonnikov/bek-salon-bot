@@ -25,6 +25,7 @@ from .schedule import (
     ScheduleConflict,
     WEEKDAY_NAMES,
     get_schedule_conflicts,
+    get_weekday_conflicts,
     set_day_off,
     set_hours_override,
     remove_override,

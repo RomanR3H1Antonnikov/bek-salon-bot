@@ -619,9 +619,31 @@ async def _handle_text(
                 f"✅ {MASTERS_SEED[slug]['name']} / {WEEKDAY_NAMES[weekday]}: "
                 f"{open_t}–{close_t}"
             )
+            await _show_regular_schedule(session, chat_id, slug, prefix=prefix)
+        except ScheduleConflict as e:
+            name = MASTERS_SEED[slug]["name"]
+            day  = WEEKDAY_NAMES[weekday]
+            shown = e.conflicts[:10]
+            lines = [
+                f"⚠️ Нельзя изменить <b>{day}</b> для {name} — "
+                f"в ближайшие 90 дней {len(e.conflicts)} запись(ей):"
+            ]
+            for bk in shown:
+                lines.append(
+                    f"  • {_fmt_date_ru(bk['date'])} {bk['time']} — {bk['client_name']}"
+                )
+            if len(e.conflicts) > 10:
+                lines.append(f"  … и ещё {len(e.conflicts) - 10}")
+            lines.append(
+                "\nПеренесите или отмените эти записи, "
+                "затем повторите изменение.\n"
+                "Или поставьте разовый override через «📅 Выходной на дату» / «🕐 Часы на дату»."
+            )
+            # State остаётся regular_time:slug:wd — можно ввести другое время или выйти
+            await _send(session, chat_id, "\n".join(lines))
         except Exception as e:
             prefix = f"⚠️ Ошибка: {e}"
-        await _show_regular_schedule(session, chat_id, slug, prefix=prefix)
+            await _show_regular_schedule(session, chat_id, slug, prefix=prefix)
         return
 
     # ── Stubs для нереализованных пунктов ────────────────────────────────────
