@@ -538,6 +538,31 @@ async def _handle_text(
             await _show_regular_schedule(session, chat_id, slug)
             return
 
+    # ── Кнопки меню графика работают из любого sched-подсостояния ─────────────
+    _SCHED_INPUT_PREFIXES = (
+        "dayoff:", "hours_date:", "hours_time:", "remove:", "regular:", "regular_time:"
+    )
+    if role == "owner" and any(state.startswith(p) for p in _SCHED_INPUT_PREFIXES):
+        slug = state.split(":")[1]
+        if text == "📅 Выходной на дату":
+            _STATE[chat_id] = f"dayoff:{slug}"
+            await _send(session, chat_id,
+                f"Введите дату выходного для <b>{MASTERS_SEED[slug]['name']}</b>:\n"
+                "Формат: ГГГГ-ММ-ДД  или  ДД.ММ.ГГГГ")
+            return
+        if text == "🕐 Часы на дату":
+            _STATE[chat_id] = f"hours_date:{slug}"
+            await _send(session, chat_id,
+                f"Введите дату для нестандартных часов (<b>{MASTERS_SEED[slug]['name']}</b>):\n"
+                "Формат: ГГГГ-ММ-ДД  или  ДД.ММ.ГГГГ")
+            return
+        if text == "↩️ Снять исключение":
+            await _show_remove_overrides(session, chat_id, slug)
+            return
+        if text == "📋 Регулярный график":
+            await _show_regular_schedule(session, chat_id, slug)
+            return
+
     # ── Ввод даты выходного (state: dayoff:<slug>) ───────────────────────────
     if state.startswith("dayoff:") and role == "owner":
         slug = state.split(":", 1)[1]
