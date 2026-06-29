@@ -14,13 +14,17 @@
 import asyncio
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from dotenv import load_dotenv
 
-from db import init_db, get_conn
+from db import init_db, get_conn, revenue_by_period
 from db.schema import MASTERS_SEED, MASTER_SLUG
+
+MSK = ZoneInfo("Europe/Moscow")
 
 _HERE = Path(__file__).parent
 load_dotenv(_HERE / ".env")
@@ -99,15 +103,21 @@ _OWNER_KB = {
 _MASTER_KB = {
     "keyboard": [
         [{"text": "📅 Мои записи на сегодня"}],
-        [{"text": "💳 Мои оплаты"}],
+        [{"text": "💰 Моя выручка"}, {"text": "💳 Мои оплаты"}],
     ],
     "resize_keyboard": True,
 }
 
-# Stub-ответы для каждого пункта меню. Реализация — следующие шаги.
+_REVENUE_KB = {
+    "keyboard": [
+        [{"text": "💰 Сегодня"},    {"text": "💰 7 дней"}],
+        [{"text": "💰 Этот месяц"}, {"text": "🔙 В меню"}],
+    ],
+    "resize_keyboard": True,
+}
+
 _OWNER_STUBS: dict[str, str] = {
     "📅 Записи на сегодня": "📅 <b>Записи на сегодня</b>\n\n⏳ Скоро.",
-    "💰 Выручка":           "💰 <b>Выручка</b>\n\n⏳ Скоро.",
     "👨‍💼 Мастера":          "👨‍💼 <b>Мастера</b>\n\n⏳ Скоро.",
     "⚙️ Настройки":        "⚙️ <b>Настройки</b>\n\n⏳ Скоро.",
 }
@@ -116,6 +126,56 @@ _MASTER_STUBS: dict[str, str] = {
     "📅 Мои записи на сегодня": "📅 <b>Мои записи</b>\n\n⏳ Скоро.",
     "💳 Мои оплаты":            "💳 <b>Мои оплаты</b>\n\n⏳ Скоро.",
 }
+
+
+# ── Revenue helpers ────────────────────────────────────────────────────────────
+
+def _revenue_period(btn: str) -> tuple[str, str]:
+    today = datetime.now(MSK).date()
+    if btn == "💰 Сегодня":
+        return str(today), str(today)
+    if btn == "💰 7 дней":
+        return str(today - timedelta(days=6)), str(today)
+    if btn == "💰 Этот месяц":
+        return str(today.replace(day=1)), str(today)
+    return str(today), str(today)
+
+
+def _fmt_money(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")  # неразрывный пробел как разделитель тысяч
+
+
+def _fmt_date_ru(d: str) -> str:
+    return datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+
+def _fmt_revenue(data: dict, role: str) -> str:
+    df, dt = data["date_from"], data["date_to"]
+    period = _fmt_date_ru(df) if df == dt else f"{_fmt_date_ru(df)} — {_fmt_date_ru(dt)}"
+
+    if role == "owner":
+        if data["count"] == 0:
+            return f"💰 <b>Выручка {period}</b>\n\nНет оплаченных записей."
+        lines = [
+            f"💰 <b>Выручка {period}</b>",
+            "",
+            f"Итого:  <b>{_fmt_money(data['total'])} ₽</b>  ({data['count']} зап.)",
+        ]
+        if len(data["by_master"]) > 1:
+            lines.append("")
+            for m in data["by_master"]:
+                lines.append(
+                    f"  👤 {m['master_name']}:  {_fmt_money(m['total'])} ₽"
+                    f"  ({m['count']} зап.)"
+                )
+        return "\n".join(lines)
+    else:
+        if data["count"] == 0:
+            return f"💰 <b>Ваша выручка {period}</b>\n\nНет оплаченных записей."
+        return (
+            f"💰 <b>Ваша выручка {period}</b>\n\n"
+            f"<b>{_fmt_money(data['total'])} ₽</b>  ({data['count']} записей)"
+        )
 
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
@@ -182,18 +242,41 @@ async def _handle_text(
     if master is None and BEK_OWNER_ID and tg_id == BEK_OWNER_ID:
         master = {"slug": MASTER_SLUG, "name": "Бек", "role": "owner"}
     if master is None:
-        return  # неавторизованный — молча игнорируем
+        return
 
-    if master["role"] == "owner":
-        stubs, kb = _OWNER_STUBS, _OWNER_KB
-    else:
-        stubs, kb = _MASTER_STUBS, _MASTER_KB
+    role = master["role"]
+    main_kb = _OWNER_KB if role == "owner" else _MASTER_KB
 
+    # ── Кнопка "Назад" из любого подменю ─────────────────────────────────────
+    if text == "🔙 В меню":
+        await _send(session, chat_id, "Главное меню:", keyboard=main_kb)
+        return
+
+    # ── Открыть подменю выручки ───────────────────────────────────────────────
+    if text in ("💰 Выручка", "💰 Моя выручка"):
+        await _send(session, chat_id, "Выберите период:", keyboard=_REVENUE_KB)
+        return
+
+    # ── Период выручки ────────────────────────────────────────────────────────
+    if text in ("💰 Сегодня", "💰 7 дней", "💰 Этот месяц"):
+        master_filter = None if role == "owner" else master["slug"]
+        date_from, date_to = _revenue_period(text)
+        try:
+            data = revenue_by_period(date_from, date_to, master_slug=master_filter)
+            msg  = _fmt_revenue(data, role)
+        except Exception as e:
+            print(f"[MANAGE] revenue error: {e}")
+            msg = "⚠️ Ошибка при расчёте выручки."
+        await _send(session, chat_id, msg, keyboard=_REVENUE_KB)
+        return
+
+    # ── Stubs для остальных пунктов ───────────────────────────────────────────
+    stubs = _OWNER_STUBS if role == "owner" else _MASTER_STUBS
     reply = stubs.get(text)
     if reply:
         await _send(session, chat_id, reply)
     else:
-        await _send(session, chat_id, "Используйте кнопки меню.", keyboard=kb)
+        await _send(session, chat_id, "Используйте кнопки меню.", keyboard=main_kb)
 
 
 # ── Dispatch ───────────────────────────────────────────────────────────────────

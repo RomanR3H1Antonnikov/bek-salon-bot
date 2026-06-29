@@ -141,6 +141,7 @@ def init_db() -> None:
             manage_token     TEXT    UNIQUE,     -- secrets.token_urlsafe(16), выдаётся клиенту
             paid             INTEGER DEFAULT 0,  -- 0=не оплачено, 1=оплачено
             paid_at          TEXT,               -- datetime MSK когда отмечено
+            total_price      INTEGER,            -- снимок суммы на момент создания
             -- created_at хранится в UTC (SQLite datetime('now')), start_time — МСК.
             -- Не сравнивай их напрямую — расхождение в 3ч.
             created_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
@@ -155,6 +156,14 @@ def init_db() -> None:
         c.execute("ALTER TABLE bookings ADD COLUMN paid INTEGER DEFAULT 0")
     if "paid_at" not in _booking_cols:
         c.execute("ALTER TABLE bookings ADD COLUMN paid_at TEXT")
+    if "total_price" not in _booking_cols:
+        c.execute("ALTER TABLE bookings ADD COLUMN total_price INTEGER")
+        # Заполняем снимок для существующих броней из booking_services
+        c.execute("""
+            UPDATE bookings SET total_price = (
+                SELECT SUM(bs.price) FROM booking_services bs WHERE bs.booking_id = bookings.id
+            )
+        """)
     # Partial unique index: NULL не индексируется, только реальные токены уникальны
     c.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_manage_token "

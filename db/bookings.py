@@ -175,19 +175,9 @@ def _insert_booking(
 
     manage_token = secrets.token_urlsafe(16)
 
-    c.execute(
-        """
-        INSERT INTO bookings
-            (master_id, client_id, start_time, end_time, status, source, note,
-             master_notified, manage_token)
-        VALUES (?, ?, ?, ?, 'booked', ?, ?, ?, ?)
-        """,
-        (master_id, client_id, start_iso, end_iso, source, note,
-         1 if source == "bot" else 0, manage_token),
-    )
-    booking_id = c.lastrowid
-
+    # Считаем total_price до INSERT, чтобы персистировать снимок вместе с бронью
     total_price = 0
+    svc_rows: list[tuple[int, int]] = []
     for slug in services:
         c.execute(
             "SELECT id, price FROM services WHERE slug = ? AND active = 1", (slug,)
@@ -195,12 +185,26 @@ def _insert_booking(
         svc = c.fetchone()
         if not svc:
             raise ValueError(f"Услуга {slug!r} не найдена или отключена в БД")
-        svc_id, price = svc
+        svc_rows.append(svc)
+        total_price += svc[1]
+
+    c.execute(
+        """
+        INSERT INTO bookings
+            (master_id, client_id, start_time, end_time, status, source, note,
+             master_notified, manage_token, total_price)
+        VALUES (?, ?, ?, ?, 'booked', ?, ?, ?, ?, ?)
+        """,
+        (master_id, client_id, start_iso, end_iso, source, note,
+         1 if source == "bot" else 0, manage_token, total_price),
+    )
+    booking_id = c.lastrowid
+
+    for svc_id, price in svc_rows:
         c.execute(
             "INSERT INTO booking_services (booking_id, service_id, price) VALUES (?, ?, ?)",
             (booking_id, svc_id, price),
         )
-        total_price += price
 
     return {
         "booking_id":    booking_id,
@@ -807,5 +811,83 @@ def list_masters() -> list[dict]:
         c = conn.cursor()
         c.execute("SELECT slug, name, role FROM masters ORDER BY role DESC, name")
         return [{"slug": r[0], "name": r[1], "role": r[2]} for r in c.fetchall()]
+    finally:
+        conn.close()
+
+
+def revenue_by_period(
+    date_from: str,               # YYYY-MM-DD включительно
+    date_to: str,                 # YYYY-MM-DD включительно
+    master_slug: str | None = None,
+) -> dict:
+    """
+    Выручка за период [date_from, date_to] включительно.
+    Считается по start_time (дата визита), НЕ по paid_at.
+    Фильтр: paid=1 AND status='booked'.
+
+    Допущение: одна бронь = один мастер = одна сумма;
+    разделённых броней между мастерами нет.
+
+    Returns:
+        {
+            "date_from": str, "date_to": str,
+            "total": int, "count": int,
+            "by_master": [{"master_slug", "master_name", "total", "count"}]
+        }
+    """
+    # Верхняя граница: < следующего дня 00:00, а не <= 23:59.
+    # Страховка: если когда-нибудь добавятся слоты 23:00+ с секундами — корректно.
+    dt_from   = date_from + " 00:00"
+    dt_to_ex  = (
+        datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
+    ).strftime("%Y-%m-%d 00:00")
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        params: list = [dt_from, dt_to_ex]
+        master_filter = ""
+        if master_slug is not None:
+            master_filter = "AND m.slug = ?"
+            params.append(master_slug)
+
+        c.execute(
+            f"""
+            SELECT m.slug,
+                   m.name,
+                   SUM(b.total_price) AS total,
+                   COUNT(b.id)        AS cnt
+            FROM bookings b
+            JOIN masters m ON m.id = b.master_id
+            WHERE b.paid = 1
+              AND b.status = 'booked'
+              AND b.start_time >= ?
+              AND b.start_time <  ?
+              {master_filter}
+            GROUP BY m.id, m.slug, m.name
+            ORDER BY m.name
+            """,
+            params,
+        )
+        rows = c.fetchall()
+
+        by_master = [
+            {
+                "master_slug": r[0],
+                "master_name": r[1],
+                "total":       r[2] or 0,
+                "count":       r[3],
+            }
+            for r in rows
+        ]
+
+        return {
+            "date_from": date_from,
+            "date_to":   date_to,
+            "total":     sum(m["total"] for m in by_master),
+            "count":     sum(m["count"] for m in by_master),
+            "by_master": by_master,
+        }
     finally:
         conn.close()
