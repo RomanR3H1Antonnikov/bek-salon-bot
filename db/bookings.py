@@ -81,6 +81,129 @@ def get_or_create_client(
     return c.lastrowid
 
 
+def _check_permission(
+    c: sqlite3.Cursor,
+    *,
+    booking_master_id: int,
+    client_tg: int | None,
+    client_phone: str | None,
+    by_telegram_id: int | None,
+    by_phone: str | None,
+    by_master_slug: str | None,
+    is_owner: bool,
+    action: str,
+) -> None:
+    """Raises ValueError если запрашивающий не имеет права на действие с бронью."""
+    if is_owner:
+        return
+    if by_master_slug:
+        c.execute("SELECT id FROM masters WHERE slug = ?", (by_master_slug,))
+        row = c.fetchone()
+        if not row or row[0] != booking_master_id:
+            raise ValueError(f"Нет прав {action} эту запись: принадлежит другому мастеру")
+        return
+    if by_telegram_id is not None:
+        if client_tg != by_telegram_id:
+            raise ValueError(f"Нет прав {action} эту запись")
+        return
+    if by_phone is not None:
+        if client_phone != by_phone:
+            raise ValueError(f"Нет прав {action} эту запись")
+        return
+    raise ValueError("Не указан идентификатор запрашивающего (requester)")
+
+
+def _insert_booking(
+    conn: sqlite3.Connection,
+    c: sqlite3.Cursor,
+    *,
+    master_slug: str,
+    date: str,
+    time_start: str,
+    services: list[str],
+    telegram_id: int | None,
+    client_name: str | None,
+    phone: str | None,
+    source: str,
+    note: str | None,
+) -> dict:
+    """Вставляет бронь внутри УЖЕ ОТКРЫТОЙ BEGIN IMMEDIATE транзакции.
+    Raises SlotTaken / ValueError. Не делает commit/rollback — это задача вызывающего."""
+    total_duration = sum_duration(services)
+    start_dt  = datetime.strptime(f"{date} {time_start}", "%Y-%m-%d %H:%M")
+    end_dt    = start_dt + timedelta(minutes=total_duration)
+    start_iso = start_dt.strftime("%Y-%m-%d %H:%M")
+    end_iso   = end_dt.strftime("%Y-%m-%d %H:%M")
+
+    master_id = _get_master_id(c, master_slug)
+
+    hours = _get_day_hours(c, master_id, date)
+    if hours is None:
+        raise ValueError(f"{date} — выходной день")
+    open_dt  = datetime.strptime(f"{date} {hours[0]}", "%Y-%m-%d %H:%M")
+    close_dt = datetime.strptime(f"{date} {hours[1]}", "%Y-%m-%d %H:%M")
+    if start_dt < open_dt or end_dt > close_dt:
+        raise ValueError(
+            f"Время {time_start}–{end_dt.strftime('%H:%M')} выходит за рамки "
+            f"рабочего дня {hours[0]}–{hours[1]}"
+        )
+
+    c.execute(
+        """
+        SELECT id FROM bookings
+        WHERE master_id = ? AND status = 'booked'
+          AND start_time < ? AND end_time > ?
+        """,
+        (master_id, end_iso, start_iso),
+    )
+    conflict = c.fetchone()
+    if conflict:
+        raise SlotTaken(
+            f"Время {time_start} уже занято (пересечение с бронью #{conflict[0]})"
+        )
+
+    client_id = get_or_create_client(
+        conn, telegram_id=telegram_id, name=client_name, phone=phone
+    )
+
+    c.execute(
+        """
+        INSERT INTO bookings
+            (master_id, client_id, start_time, end_time, status, source, note, master_notified)
+        VALUES (?, ?, ?, ?, 'booked', ?, ?, ?)
+        """,
+        (master_id, client_id, start_iso, end_iso, source, note,
+         1 if source == "bot" else 0),
+    )
+    booking_id = c.lastrowid
+
+    total_price = 0
+    for slug in services:
+        c.execute(
+            "SELECT id, price FROM services WHERE slug = ? AND active = 1", (slug,)
+        )
+        svc = c.fetchone()
+        if not svc:
+            raise ValueError(f"Услуга {slug!r} не найдена или отключена в БД")
+        svc_id, price = svc
+        c.execute(
+            "INSERT INTO booking_services (booking_id, service_id, price) VALUES (?, ?, ?)",
+            (booking_id, svc_id, price),
+        )
+        total_price += price
+
+    return {
+        "booking_id":   booking_id,
+        "date":         date,
+        "time_start":   time_start,
+        "time_end":     end_dt.strftime("%H:%M"),
+        "services":     services,
+        "total_price":  total_price,
+        "duration_min": total_duration,
+        "source":       source,
+    }
+
+
 # ─── public API ────────────────────────────────────────────────────────────────
 
 def create_booking(
@@ -88,7 +211,7 @@ def create_booking(
     master_slug: str = MASTER_SLUG,
     date: str,           # YYYY-MM-DD МСК
     time_start: str,     # HH:MM МСК
-    services: list[str], # список slug'ов услуг; длительность суммируется
+    services: list[str], # список slug'ов; длительность суммируется
     telegram_id: int | None = None,
     client_name: str | None = None,
     phone: str | None = None,  # уже нормализован вызывающей стороной (FastAPI)
@@ -97,95 +220,209 @@ def create_booking(
 ) -> dict:
     """
     Единая функция брони для юзербота и FastAPI.
-    Все проверки (выходной, рабочие часы, пересечения) внутри одной BEGIN IMMEDIATE транзакции.
-    Raises SlotTaken при конфликте времени, ValueError при остальных ошибках валидации.
+    Все проверки (выходной, рабочие часы, пересечения) внутри BEGIN IMMEDIATE.
+    Raises SlotTaken при конфликте, ValueError при остальных ошибках валидации.
     """
-    total_duration = sum_duration(services)  # ValueError если пусто или неизвестный slug
-
-    start_dt  = datetime.strptime(f"{date} {time_start}", "%Y-%m-%d %H:%M")
-    end_dt    = start_dt + timedelta(minutes=total_duration)
-    start_iso = start_dt.strftime("%Y-%m-%d %H:%M")
-    end_iso   = end_dt.strftime("%Y-%m-%d %H:%M")
-
-    # BEGIN IMMEDIATE: эксклюзивная блокировка до SELECT — исключает двойные брони.
+    sum_duration(services)  # ранняя валидация до захвата блокировки БД
     conn = get_conn_immediate()
     try:
         c = conn.cursor()
-        master_id = _get_master_id(c, master_slug)
+        result = _insert_booking(
+            conn, c,
+            master_slug=master_slug, date=date, time_start=time_start,
+            services=services, telegram_id=telegram_id, client_name=client_name,
+            phone=phone, source=source, note=note,
+        )
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-        # 1. День не выходной + весь визит укладывается в рабочие часы
-        hours = _get_day_hours(c, master_id, date)
-        if hours is None:
-            raise ValueError(f"{date} — выходной день")
 
-        open_dt  = datetime.strptime(f"{date} {hours[0]}", "%Y-%m-%d %H:%M")
-        close_dt = datetime.strptime(f"{date} {hours[1]}", "%Y-%m-%d %H:%M")
+def cancel_booking(
+    booking_id: int,
+    *,
+    by_telegram_id: int | None = None,   # клиент-бот: идентифицирован по TG ID
+    by_phone: str | None = None,          # клиент-сайт: идентифицирован по телефону
+    by_master_slug: str | None = None,    # персонал-мастер: только свои записи
+    is_owner: bool = False,               # владелец (Бек): отменяет любую
+) -> dict:
+    """
+    Помечает запись как 'cancelled'. Никакого DELETE — история сохраняется.
+    Слот освобождается автоматически (все запросы занятости фильтруют status='booked').
 
-        if start_dt < open_dt or end_dt > close_dt:
+    Raises ValueError:
+      - запись не найдена / уже отменена / статус не 'booked'
+      - now(МСК) >= start_time - 15 мин (правило 15 минут)
+      - у запрашивающего нет прав
+    """
+    now_msk = datetime.now(MSK).replace(tzinfo=None)
+
+    conn = get_conn_immediate()
+    try:
+        c = conn.cursor()
+
+        c.execute(
+            """
+            SELECT b.start_time, b.status, b.master_id,
+                   cl.telegram_id, cl.phone
+            FROM bookings b
+            JOIN clients cl ON cl.id = b.client_id
+            WHERE b.id = ?
+            """,
+            (booking_id,),
+        )
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"Запись #{booking_id} не найдена")
+        start_iso, status, master_id, client_tg, client_phone = row
+
+        if status == "cancelled":
+            raise ValueError(f"Запись #{booking_id} уже отменена")
+        if status != "booked":
+            raise ValueError(f"Запись #{booking_id} имеет статус {status!r}, отмена невозможна")
+
+        start_dt = datetime.strptime(start_iso, "%Y-%m-%d %H:%M")
+        if now_msk >= start_dt - timedelta(minutes=15):
             raise ValueError(
-                f"Время {time_start}–{end_dt.strftime('%H:%M')} выходит за рамки "
-                f"рабочего дня {hours[0]}–{hours[1]}"
+                f"Отменить можно не позднее чем за 15 минут до записи "
+                f"(запись в {start_dt.strftime('%H:%M')}, сейчас {now_msk.strftime('%H:%M')})"
             )
 
-        # 2. Anti-race: пересечение с существующими бронями
+        _check_permission(
+            c,
+            booking_master_id=master_id,
+            client_tg=client_tg,
+            client_phone=client_phone,
+            by_telegram_id=by_telegram_id,
+            by_phone=by_phone,
+            by_master_slug=by_master_slug,
+            is_owner=is_owner,
+            action="отменить",
+        )
+
+        c.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
+        conn.commit()
+        return {"booking_id": booking_id, "status": "cancelled", "start_time": start_iso}
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reschedule_booking(
+    booking_id: int,
+    *,
+    new_master_slug: str,
+    new_date: str,           # YYYY-MM-DD МСК
+    new_time: str,           # HH:MM МСК
+    new_services: list[str] | None = None,  # None → берём из старой брони
+    by_telegram_id: int | None = None,
+    by_phone: str | None = None,
+    by_master_slug: str | None = None,
+    is_owner: bool = False,
+) -> dict:
+    """
+    Перенос брони: атомарная отмена старой + создание новой в BEGIN IMMEDIATE.
+
+    Гарантия отката:
+      Если новый слот занят (SlotTaken) или новое время невалидно (ValueError),
+      ROLLBACK возвращает старую запись в статус 'booked' — она остаётся нетронутой.
+
+    source нового слота наследуется от старого (bot/site).
+    Уведомление о переносе — ответственность вызывающего канала.
+
+    Raises SlotTaken, ValueError.
+    Returns {"cancelled_booking_id": int, "new_booking": dict}
+    """
+    now_msk = datetime.now(MSK).replace(tzinfo=None)
+
+    conn = get_conn_immediate()
+    try:
+        c = conn.cursor()
+
+        # ── 1. Получаем старую бронь ──────────────────────────────────────────
         c.execute(
             """
-            SELECT id FROM bookings
-            WHERE master_id = ? AND status = 'booked'
-              AND start_time < ? AND end_time > ?
+            SELECT b.start_time, b.status, b.master_id,
+                   cl.telegram_id, cl.phone, cl.name,
+                   b.source
+            FROM bookings b
+            JOIN clients cl ON cl.id = b.client_id
+            WHERE b.id = ?
             """,
-            (master_id, end_iso, start_iso),
+            (booking_id,),
         )
-        conflict = c.fetchone()
-        if conflict:
-            raise SlotTaken(
-                f"Время {time_start} уже занято (пересечение с бронью #{conflict[0]})"
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"Запись #{booking_id} не найдена")
+        start_iso, status, old_master_id, client_tg, client_phone, client_name, old_source = row
+
+        if status == "cancelled":
+            raise ValueError(f"Запись #{booking_id} уже отменена, перенос невозможен")
+        if status != "booked":
+            raise ValueError(f"Запись #{booking_id} имеет статус {status!r}")
+
+        # ── 2. Правило 15 минут (для старого времени) ─────────────────────────
+        start_dt = datetime.strptime(start_iso, "%Y-%m-%d %H:%M")
+        if now_msk >= start_dt - timedelta(minutes=15):
+            raise ValueError(
+                f"Перенести можно не позднее чем за 15 минут до записи "
+                f"(запись в {start_dt.strftime('%H:%M')}, сейчас {now_msk.strftime('%H:%M')})"
             )
 
-        # 3. Клиент (дедуп telegram_id → phone → новый)
-        client_id = get_or_create_client(
-            conn, telegram_id=telegram_id, name=client_name, phone=phone
+        # ── 3. Проверка прав (по старой записи) ──────────────────────────────
+        _check_permission(
+            c,
+            booking_master_id=old_master_id,
+            client_tg=client_tg,
+            client_phone=client_phone,
+            by_telegram_id=by_telegram_id,
+            by_phone=by_phone,
+            by_master_slug=by_master_slug,
+            is_owner=is_owner,
+            action="перенести",
         )
 
-        # 4. Вставка брони
-        c.execute(
-            """
-            INSERT INTO bookings
-                (master_id, client_id, start_time, end_time, status, source, note, master_notified)
-            VALUES (?, ?, ?, ?, 'booked', ?, ?, ?)
-            """,
-            (master_id, client_id, start_iso, end_iso, source, note,
-             1 if source == "bot" else 0),
-        )
-        booking_id = c.lastrowid
-
-        # 5. Услуги: снимок цены на момент брони (M:N)
-        total_price = 0
-        for slug in services:
+        # ── 4. Услуги: если не переданы явно — берём из старой брони ─────────
+        if new_services is None:
             c.execute(
-                "SELECT id, price FROM services WHERE slug = ? AND active = 1", (slug,)
+                """
+                SELECT s.slug FROM booking_services bs
+                JOIN services s ON s.id = bs.service_id
+                WHERE bs.booking_id = ?
+                """,
+                (booking_id,),
             )
-            svc = c.fetchone()
-            if not svc:
-                raise ValueError(f"Услуга {slug!r} не найдена или отключена в БД")
-            svc_id, price = svc
-            c.execute(
-                "INSERT INTO booking_services (booking_id, service_id, price) VALUES (?, ?, ?)",
-                (booking_id, svc_id, price),
-            )
-            total_price += price
+            new_services = [r[0] for r in c.fetchall()]
+        if not new_services:
+            raise ValueError(f"Не удалось получить список услуг для переноса #{booking_id}")
+
+        # ── 5. Отменяем старую бронь ──────────────────────────────────────────
+        c.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
+
+        # ── 6. Создаём новую (может поднять SlotTaken → весь блок откатится) ─
+        new_booking = _insert_booking(
+            conn, c,
+            master_slug=new_master_slug,
+            date=new_date,
+            time_start=new_time,
+            services=new_services,
+            telegram_id=client_tg,
+            client_name=client_name,
+            phone=client_phone,
+            source=old_source,
+            note=f"Перенесено с #{booking_id}",
+        )
 
         conn.commit()
-        return {
-            "booking_id":   booking_id,
-            "date":         date,
-            "time_start":   time_start,
-            "time_end":     end_dt.strftime("%H:%M"),
-            "services":     services,
-            "total_price":  total_price,
-            "duration_min": total_duration,
-            "source":       source,
-        }
+        return {"cancelled_booking_id": booking_id, "new_booking": new_booking}
+
     except Exception:
         conn.rollback()
         raise
@@ -356,17 +593,6 @@ def get_pending_master_notifications() -> list[dict]:
         conn.close()
 
 
-def list_masters() -> list[dict]:
-    """Список мастеров из БД (slug, name, role)."""
-    conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT slug, name, role FROM masters ORDER BY role DESC, name")
-        return [{"slug": r[0], "name": r[1], "role": r[2]} for r in c.fetchall()]
-    finally:
-        conn.close()
-
-
 def mark_master_notified(booking_id: int) -> None:
     conn = get_conn()
     try:
@@ -374,5 +600,16 @@ def mark_master_notified(booking_id: int) -> None:
             conn.execute(
                 "UPDATE bookings SET master_notified = 1 WHERE id = ?", (booking_id,)
             )
+    finally:
+        conn.close()
+
+
+def list_masters() -> list[dict]:
+    """Список мастеров из БД (slug, name, role)."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT slug, name, role FROM masters ORDER BY role DESC, name")
+        return [{"slug": r[0], "name": r[1], "role": r[2]} for r in c.fetchall()]
     finally:
         conn.close()

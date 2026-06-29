@@ -7,6 +7,8 @@ from .schema import (
 from .bookings import (
     SlotTaken,
     create_booking,
+    cancel_booking,
+    reschedule_booking,
     is_slot_available,
     get_free_slots,
     get_upcoming_reminders,
