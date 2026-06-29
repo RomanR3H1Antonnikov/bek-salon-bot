@@ -891,3 +891,54 @@ def revenue_by_period(
         }
     finally:
         conn.close()
+
+
+def get_today_bookings(date: str, master_slug: str | None = None) -> list[dict]:
+    """
+    Записи на конкретную дату (YYYY-MM-DD, МСК).
+    master_slug=None → все мастера (для owner).
+    Возвращает только status='booked', сортировка по start_time.
+    """
+    master_filter = "AND m.slug = ?" if master_slug else ""
+    params: list = [date + " %"]
+    if master_slug:
+        params.append(master_slug)
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            f"""
+            SELECT b.start_time, b.end_time,
+                   cl.name, cl.phone,
+                   m.name,
+                   b.paid, b.total_price,
+                   GROUP_CONCAT(s.name, ', ') AS services
+            FROM   bookings b
+            JOIN   clients cl ON cl.id = b.client_id
+            JOIN   masters m  ON m.id  = b.master_id
+            LEFT JOIN booking_services bs ON bs.booking_id = b.id
+            LEFT JOIN services s          ON s.id          = bs.service_id
+            WHERE  b.status = 'booked'
+              AND  b.start_time LIKE ?
+              {master_filter}
+            GROUP  BY b.id
+            ORDER  BY b.start_time
+            """,
+            params,
+        )
+        return [
+            {
+                "start":        r[0],
+                "end":          r[1],
+                "client_name":  r[2] or "—",
+                "client_phone": r[3] or "",
+                "master_name":  r[4],
+                "paid":         bool(r[5]),
+                "total_price":  r[6],
+                "services":     r[7] or "",
+            }
+            for r in c.fetchall()
+        ]
+    finally:
+        conn.close()

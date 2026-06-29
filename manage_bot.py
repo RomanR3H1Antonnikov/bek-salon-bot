@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from dotenv import load_dotenv
 
-from db import init_db, get_conn, revenue_by_period
+from db import init_db, get_conn, revenue_by_period, get_today_bookings
 from db.schema import MASTERS_SEED, MASTER_SLUG
 from db.schedule import (
     ScheduleConflict,
@@ -155,13 +155,11 @@ _SCHED_MASTER_VIEW_KB = {
 }
 
 _OWNER_STUBS: dict[str, str] = {
-    "📅 Записи на сегодня": "📅 <b>Записи на сегодня</b>\n\n⏳ Скоро.",
-    "⚙️ Настройки":        "⚙️ <b>Настройки</b>\n\n⏳ Скоро.",
+    "⚙️ Настройки": "⚙️ <b>Настройки</b>\n\n⏳ Скоро.",
 }
 
 _MASTER_STUBS: dict[str, str] = {
-    "📅 Мои записи на сегодня": "📅 <b>Мои записи</b>\n\n⏳ Скоро.",
-    "💳 Мои оплаты":            "💳 <b>Мои оплаты</b>\n\n⏳ Скоро.",
+    "💳 Мои оплаты": "💳 <b>Мои оплаты</b>\n\n⏳ Скоро.",
 }
 
 
@@ -474,6 +472,39 @@ async def _handle_text(
     if text == "🔙 К мастерам" and role == "owner":
         _STATE[chat_id] = "masters"
         await _send(session, chat_id, "Выберите мастера:", keyboard=_MASTERS_KB)
+        return
+
+    # ── Записи на сегодня ────────────────────────────────────────────────────
+    if text in ("📅 Записи на сегодня", "📅 Мои записи на сегодня"):
+        today    = datetime.now(MSK).strftime("%Y-%m-%d")
+        today_ru = datetime.now(MSK).strftime("%d.%m.%Y")
+        master_filter = None if role == "owner" else master["slug"]
+        try:
+            bookings = get_today_bookings(today, master_slug=master_filter)
+        except Exception as e:
+            print(f"[MANAGE] today_bookings error: {e}")
+            await _send(session, chat_id, "⚠️ Ошибка при загрузке записей.", keyboard=main_kb)
+            return
+
+        if not bookings:
+            title = "Записи на сегодня" if role == "owner" else "Мои записи на сегодня"
+            msg = f"📅 <b>{title} — {today_ru}</b>\n\nЗаписей нет."
+        else:
+            title = "Записи на сегодня" if role == "owner" else "Мои записи на сегодня"
+            lines = [f"📅 <b>{title} — {today_ru}</b>  ({len(bookings)} зап.)"]
+            for b in bookings:
+                t  = f"{b['start'][11:16]}–{b['end'][11:16]}"
+                mp = f"  [{b['master_name']}]" if role == "owner" else ""
+                paid_icon = "✅" if b["paid"] else "💳"
+                lines.append(f"\n<b>{t}</b>  {b['client_name']}{mp}")
+                if b["client_phone"]:
+                    lines.append(f"  📞 {b['client_phone']}")
+                if b["services"]:
+                    price = f"  •  {b['total_price']:,}".replace(",", " ") + " ₽" if b["total_price"] else ""
+                    lines.append(f"  ✂️ {b['services']}{price}  {paid_icon}")
+            msg = "\n".join(lines)
+
+        await _send(session, chat_id, msg, keyboard=main_kb)
         return
 
     # ── Выручка ──────────────────────────────────────────────────────────────
