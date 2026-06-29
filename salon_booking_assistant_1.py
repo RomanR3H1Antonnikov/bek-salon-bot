@@ -453,11 +453,9 @@ async def handler(event):
             elif 'обед' in tl or 'днём' in tl or 'дн ' in tl:
                 free = [s for s in free if "13:00" <= s < "18:00"]
             if free:
-                shown = free[:12]
-                tail  = " и др." if len(free) > 12 else ""
                 await safe_reply(event,
                     f"Свободные окна на {human_date(avail_date)}:\n"
-                    f"{', '.join(shown)}{tail}\n\n"
+                    f"{', '.join(free)}\n\n"
                     "Напишите удобное время — и запишу."
                 )
             else:
@@ -543,13 +541,12 @@ async def handler(event):
                 "**Подтверждаете** запись?  (да / нет)"
             )
         else:
-            alts = get_free_slots(MASTER_SLUG, date_str, duration, limit=6)
+            alts = get_free_slots(MASTER_SLUG, date_str, duration)
             if alts:
-                alt_text = ', '.join(alts[:4]) + (' и др.' if len(alts) > 4 else '')
                 await safe_reply(event,
                     f"Это время занято.\n"
                     f"Свободные окна на {human_date(date_str)}:\n"
-                    f"{alt_text}\n\n"
+                    f"{', '.join(alts)}\n\n"
                     "Напишите желаемое время."
                 )
             else:
