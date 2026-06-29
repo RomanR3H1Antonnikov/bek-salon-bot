@@ -139,15 +139,22 @@ def init_db() -> None:
             reminded         INTEGER DEFAULT 0,
             master_notified  INTEGER DEFAULT 0,
             manage_token     TEXT    UNIQUE,     -- secrets.token_urlsafe(16), выдаётся клиенту
+            paid             INTEGER DEFAULT 0,  -- 0=не оплачено, 1=оплачено
+            paid_at          TEXT,               -- datetime MSK когда отмечено
             -- created_at хранится в UTC (SQLite datetime('now')), start_time — МСК.
             -- Не сравнивай их напрямую — расхождение в 3ч.
             created_at       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
         )
     """)
-    # Миграция: добавляем manage_token к существующим БД
+    # Все колонные миграции bookings — единый PRAGMA (идемпотентно)
     c.execute("PRAGMA table_info(bookings)")
-    if "manage_token" not in {row[1] for row in c.fetchall()}:
+    _booking_cols = {row[1] for row in c.fetchall()}
+    if "manage_token" not in _booking_cols:
         c.execute("ALTER TABLE bookings ADD COLUMN manage_token TEXT")
+    if "paid" not in _booking_cols:
+        c.execute("ALTER TABLE bookings ADD COLUMN paid INTEGER DEFAULT 0")
+    if "paid_at" not in _booking_cols:
+        c.execute("ALTER TABLE bookings ADD COLUMN paid_at TEXT")
     # Partial unique index: NULL не индексируется, только реальные токены уникальны
     c.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_manage_token "

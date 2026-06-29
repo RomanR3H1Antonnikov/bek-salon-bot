@@ -692,6 +692,114 @@ def mark_master_notified(booking_id: int) -> None:
         conn.close()
 
 
+def _check_payment_permission(
+    c: sqlite3.Cursor,
+    *,
+    booking_master_id: int,
+    by_master_slug: str | None,
+    is_owner: bool,
+) -> None:
+    """Только персонал может отмечать оплату. Raises ValueError если нет прав."""
+    if is_owner:
+        return
+    if by_master_slug is not None:
+        c.execute("SELECT id FROM masters WHERE slug = ?", (by_master_slug,))
+        row = c.fetchone()
+        if not row or row[0] != booking_master_id:
+            raise ValueError(
+                "Нет прав отметить оплату для этой записи: принадлежит другому мастеру"
+            )
+        return
+    raise ValueError("Не указан идентификатор персонала для отметки оплаты")
+
+
+def mark_paid(
+    booking_id: int,
+    *,
+    by_master_slug: str | None = None,
+    is_owner: bool = False,
+) -> dict:
+    """
+    Отмечает запись как оплаченную. Идемпотентно: повторный вызов не трогает paid_at.
+    Raises ValueError если status != 'booked' или нет прав.
+    """
+    conn = get_conn_immediate()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT status, master_id FROM bookings WHERE id = ?", (booking_id,))
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"Запись #{booking_id} не найдена")
+        status, master_id = row
+
+        if status != "booked":
+            raise ValueError(
+                f"Нельзя отметить оплату: запись #{booking_id} имеет статус {status!r}"
+            )
+
+        _check_payment_permission(
+            c, booking_master_id=master_id, by_master_slug=by_master_slug, is_owner=is_owner
+        )
+
+        paid_at_new = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S")
+        # COALESCE сохраняет оригинальную метку времени при повторном вызове
+        c.execute(
+            "UPDATE bookings SET paid = 1, paid_at = COALESCE(paid_at, ?) WHERE id = ?",
+            (paid_at_new, booking_id),
+        )
+        c.execute("SELECT paid_at FROM bookings WHERE id = ?", (booking_id,))
+        paid_at = c.fetchone()[0]
+
+        conn.commit()
+        return {"booking_id": booking_id, "paid": True, "paid_at": paid_at}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def mark_unpaid(
+    booking_id: int,
+    *,
+    by_master_slug: str | None = None,
+    is_owner: bool = False,
+) -> dict:
+    """
+    Откатывает отметку оплаты (исправление ошибки мастера). Идемпотентно.
+    Raises ValueError если status != 'booked' или нет прав.
+    """
+    conn = get_conn_immediate()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT status, master_id FROM bookings WHERE id = ?", (booking_id,))
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"Запись #{booking_id} не найдена")
+        status, master_id = row
+
+        if status != "booked":
+            raise ValueError(
+                f"Нельзя снять оплату: запись #{booking_id} имеет статус {status!r}"
+            )
+
+        _check_payment_permission(
+            c, booking_master_id=master_id, by_master_slug=by_master_slug, is_owner=is_owner
+        )
+
+        c.execute(
+            "UPDATE bookings SET paid = 0, paid_at = NULL WHERE id = ?",
+            (booking_id,),
+        )
+        conn.commit()
+        return {"booking_id": booking_id, "paid": False, "paid_at": None}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def list_masters() -> list[dict]:
     """Список мастеров из БД (slug, name, role)."""
     conn = get_conn()
