@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from db import (
     MASTER_SLUG, MASTERS_SEED,
-    SlotTaken,
+    SlotTaken, AlreadyCancelled, TooLate,
     create_booking, cancel_booking, reschedule_booking, get_booking_by_token,
     get_free_slots, list_masters,
     init_db, sum_duration,
@@ -29,6 +29,7 @@ from db import (
 
 # ================== КОНФИГ ==================
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
+BASE_URL       = os.environ.get("BASE_URL", "https://barber.rehy.store")
 PORT           = 8000
 HOST           = "127.0.0.1"
 MSK            = ZoneInfo("Europe/Moscow")
@@ -166,6 +167,7 @@ async def book(
             phone=phone_norm,
             source="site",
         )
+        result["manage_url"] = f"{BASE_URL}/b/{result['manage_token']}"
         return result
 
     except SlotTaken as e:
@@ -211,10 +213,11 @@ async def cancel(req: CancelRequest, _: None = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Запись не найдена")
 
     try:
-        result = cancel_booking(info["booking_id"], by_manage_token=req.token)
-        return result
+        return cancel_booking(info["booking_id"], by_manage_token=req.token)
+    except (AlreadyCancelled, TooLate, SlotTaken) as e:
+        raise HTTPException(status_code=409, detail={"code": e.code, "message": str(e)})
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 class RescheduleRequest(BaseModel):
@@ -248,7 +251,7 @@ async def reschedule(req: RescheduleRequest, _: None = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="Запись не найдена")
 
     try:
-        result = reschedule_booking(
+        return reschedule_booking(
             info["booking_id"],
             new_master_slug=req.master_id,
             new_date=req.date,
@@ -256,11 +259,10 @@ async def reschedule(req: RescheduleRequest, _: None = Depends(verify_token)):
             new_services=req.services,
             by_manage_token=req.token,
         )
-        return result
-    except SlotTaken as e:
-        raise HTTPException(status_code=409, detail={"code": "slot_taken", "message": str(e)})
+    except (AlreadyCancelled, TooLate, SlotTaken) as e:
+        raise HTTPException(status_code=409, detail={"code": e.code, "message": str(e)})
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         print(f"[API] Ошибка /reschedule: {e}")
         raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера")

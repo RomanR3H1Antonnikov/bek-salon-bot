@@ -6,6 +6,8 @@ from .schema import (
 )
 from .bookings import (
     SlotTaken,
+    AlreadyCancelled,
+    TooLate,
     create_booking,
     cancel_booking,
     reschedule_booking,
